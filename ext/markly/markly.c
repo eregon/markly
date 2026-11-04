@@ -43,35 +43,72 @@ static VALUE sym_left;
 static VALUE sym_right;
 static VALUE sym_center;
 
-static void Markly_Node_Type_free(void *data) {
-	// If a parent of this node is already freed, `Markly_Node_freed` will ensure all the nodes are nullified.
-	if (data) {
-		cmark_node *node = (cmark_node*)data;
-		
-		if (cmark_node_parent(node) == NULL) {
-			cmark_node_free(node);
-		} else {
-			cmark_node_set_user_data(node, NULL);
-		}
+// A node is freed with the root of its tree (which is owned by the Ruby object of the root),
+// while a Ruby object is freed by the GC, so their lifetimes are independent. They are connected
+// through a separately allocated link, which is freed once both are gone. This way, freeing a node
+// or a Ruby object never accesses another Ruby object, which is not allowed in a free function
+// (the other object may be dead or already freed) and only works on CRuby by accident.
+typedef struct {
+	// NULL once the node was freed.
+	cmark_node *node;
+	// 0 once the Ruby object was freed.
+	VALUE object;
+} Markly_Node_Link;
+
+static void Markly_Node_Link_free_if_unused(Markly_Node_Link *link) {
+	if (link->node == NULL && link->object == 0) {
+		xfree(link);
 	}
 }
 
+// Called by cmark when the node is freed.
+static void Markly_Node_freed(cmark_mem *mem, void *user_data) {
+	Markly_Node_Link *link = user_data;
+
+	link->node = NULL;
+	Markly_Node_Link_free_if_unused(link);
+}
+
+static void Markly_Node_Type_free(void *data) {
+	Markly_Node_Link *link = data;
+	cmark_node *node = link->node;
+
+	link->object = 0;
+
+	if (node == NULL) {
+		// The node was already freed with its tree.
+		Markly_Node_Link_free_if_unused(link);
+	} else if (cmark_node_parent(node) == NULL) {
+		// A root node owns its tree: free it, which frees the link of every node (including this one) through `Markly_Node_freed`.
+		cmark_node_free(node);
+	}
+	// Otherwise the node is still owned by its tree: the link stays attached to the node, so it can be wrapped again, and is freed with the node.
+}
+
 static void Markly_Node_Type_mark(void *data) {
-	cmark_node *node = data;
+	Markly_Node_Link *link = data;
+	cmark_node *node = link->node;
+
+	if (node == NULL) {
+		return;
+	}
 	
 	// Mark the parent to make sure that the tree won't be freed as long as a child node is referenced.
 	cmark_node *parent = cmark_node_parent(node);
 	if (parent) {
-		void *user_data = cmark_node_get_user_data(parent);
-		rb_gc_mark((VALUE)user_data);
+		Markly_Node_Link *parent_link = cmark_node_get_user_data(parent);
+
+		if (parent_link && parent_link->object) {
+			rb_gc_mark(parent_link->object);
+		}
 	}
 	
 	// Mark all children to make sure their cached Ruby objects won't be freed.
 	for (cmark_node *child = cmark_node_first_child(node); child != NULL; child = cmark_node_next(child)) {
-		void *user_data = cmark_node_get_user_data(child);
+		Markly_Node_Link *child_link = cmark_node_get_user_data(child);
 		
-		if (user_data) {
-			rb_gc_mark((VALUE)user_data);
+		if (child_link && child_link->object) {
+			rb_gc_mark(child_link->object);
 		}
 	}
 }
@@ -86,27 +123,37 @@ static const rb_data_type_t Markly_Node_Type = {
 	.flags = RUBY_TYPED_FREE_IMMEDIATELY,
 };
 
-static void Markly_Node_freed(cmark_mem *mem, void *user_data) {
-	VALUE self = (VALUE)user_data;
-	
-	RTYPEDDATA_DATA(self) = NULL;
-}
-
 static VALUE Markly_Node_wrap(cmark_node *node) {
 	if (node == NULL)
 		return Qnil;
 	
-	void * user_data = cmark_node_get_user_data(node);
+	Markly_Node_Link *link = cmark_node_get_user_data(node);
 	
-	if (user_data) {
-		return (VALUE)user_data;
+	if (link == NULL) {
+		link = ZALLOC(Markly_Node_Link);
+		link->node = node;
+		cmark_node_set_user_data(node, link);
+		cmark_node_set_user_data_free_func(node, Markly_Node_freed);
+	} else if (link->object) {
+		return link->object;
 	}
 	
-	VALUE self = TypedData_Wrap_Struct(Markly_Node, &Markly_Node_Type, node);
-	cmark_node_set_user_data(node, (void *)self);
-	cmark_node_set_user_data_free_func(node, Markly_Node_freed);
+	VALUE self = TypedData_Wrap_Struct(Markly_Node, &Markly_Node_Type, link);
+	link->object = self;
 	
 	return self;
+}
+
+// The node of a Ruby object. It is never freed while the Ruby object is alive, see `Markly_Node_Type_mark`.
+static cmark_node *Markly_Node_get(VALUE self) {
+	Markly_Node_Link *link;
+	TypedData_Get_Struct(self, Markly_Node_Link, &Markly_Node_Type, link);
+
+	if (link->node == NULL) {
+		rb_raise(Markly_Error, "node was already freed");
+	}
+
+	return link->node;
 }
 
 static void Markly_Parser_Type_free(void *data) {
@@ -120,8 +167,11 @@ static void Markly_Parser_Type_mark(void *data) {
 	cmark_node *root = parser->root;
 	
 	if (root) {
-		void *user_data = cmark_node_get_user_data(root);
-		rb_gc_mark((VALUE)user_data);
+		Markly_Node_Link *link = cmark_node_get_user_data(root);
+
+		if (link && link->object) {
+			rb_gc_mark(link->object);
+		}
 	}
 }
 
@@ -276,7 +326,7 @@ static VALUE Markly_Node_new(VALUE self, VALUE type) {
  */
 static VALUE Markly_Node_duplicate(VALUE self) {
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	cmark_node *copy = cmark_node_clone(node);
 	if (copy == NULL) {
@@ -289,8 +339,8 @@ static VALUE Markly_Node_duplicate(VALUE self) {
 static VALUE Markly_Node_replace(VALUE self, VALUE other) {
 	cmark_node *current_node = NULL, *replacement_node = NULL;
 	
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, current_node);
-	TypedData_Get_Struct(other, cmark_node, &Markly_Node_Type, replacement_node);
+	current_node = Markly_Node_get(self);
+	replacement_node = Markly_Node_get(other);
 	
 	int result = cmark_node_replace(current_node, replacement_node);
 	
@@ -316,7 +366,7 @@ static VALUE encode_utf8_string(const char *c_string) {
 static VALUE Markly_Node_get_string_content(VALUE self) {
 	const char *text;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	text = cmark_node_get_literal(node);
 
@@ -339,7 +389,7 @@ static VALUE Markly_Node_set_string_content(VALUE self, VALUE s) {
 	cmark_node *node;
 	Check_Type(s, T_STRING);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	text = StringValueCStr(s);
 
 	if (!cmark_node_set_literal(node, text)) {
@@ -360,7 +410,7 @@ static VALUE Markly_Node_get_type(VALUE self) {
 	VALUE symbol = Qnil;
 	const char *s = NULL;
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	node_type = cmark_node_get_type(node);
 	symbol = Qnil;
@@ -456,7 +506,7 @@ static VALUE Markly_Node_get_source_position(VALUE self) {
 	VALUE result;
 
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	start_line = cmark_node_get_start_line(node);
 	start_column = cmark_node_get_start_column(node);
@@ -479,7 +529,7 @@ static VALUE Markly_Node_get_source_position(VALUE self) {
  */
 static VALUE Markly_Node_get_type_string(VALUE self) {
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	return rb_str_new2(cmark_node_get_type_string(node));
 }
@@ -490,7 +540,7 @@ static VALUE Markly_Node_get_type_string(VALUE self) {
  */
 static VALUE Markly_Node_unlink(VALUE self) {
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	cmark_node_unlink(node);
 
@@ -503,7 +553,7 @@ static VALUE Markly_Node_unlink(VALUE self) {
  */
 static VALUE Markly_Node_first_child(VALUE self) {
 	cmark_node *node, *child;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	child = cmark_node_first_child(node);
 
@@ -516,7 +566,7 @@ static VALUE Markly_Node_first_child(VALUE self) {
  */
 static VALUE Markly_Node_next(VALUE self) {
 	cmark_node *node, *next;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	next = cmark_node_next(node);
 
@@ -533,8 +583,8 @@ static VALUE Markly_Node_next(VALUE self) {
  */
 static VALUE Markly_Node_insert_before(VALUE self, VALUE sibling) {
 	cmark_node *node1, *node2;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node1);
-	TypedData_Get_Struct(sibling, cmark_node, &Markly_Node_Type, node2);
+	node1 = Markly_Node_get(self);
+	node2 = Markly_Node_get(sibling);
 
 	if (!cmark_node_insert_before(node1, node2)) {
 		rb_raise(Markly_Error, "could not insert before");
@@ -559,7 +609,7 @@ static VALUE Markly_Node_render_html(VALUE self, VALUE rb_options, VALUE rb_exte
 	int options = FIX2INT(rb_options);
 	long extensions_len = RARRAY_LEN(rb_extensions);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	for (i = 0; i < extensions_len; ++i) {
 		rb_ext_name = RARRAY_PTR(rb_extensions)[i];
@@ -608,7 +658,7 @@ static VALUE Markly_Node_render_commonmark(int argc, VALUE *argv, VALUE self) {
 	Check_Type(rb_options, T_FIXNUM);
 
 	options = FIX2INT(rb_options);
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	char *cmark = cmark_render_commonmark(node, options, width);
 	VALUE ruby_cmark = rb_str_new2(cmark);
@@ -636,7 +686,7 @@ static VALUE Markly_Node_render_plaintext(int argc, VALUE *argv, VALUE self) {
 	Check_Type(rb_options, T_FIXNUM);
 
 	options = FIX2INT(rb_options);
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	char *text = cmark_render_plaintext(node, options, width);
 	VALUE ruby_text = rb_str_new2(text);
@@ -655,8 +705,8 @@ static VALUE Markly_Node_render_plaintext(int argc, VALUE *argv, VALUE self) {
  */
 static VALUE Markly_Node_insert_after(VALUE self, VALUE sibling) {
 	cmark_node *node1, *node2;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node1);
-	TypedData_Get_Struct(sibling, cmark_node, &Markly_Node_Type, node2);
+	node1 = Markly_Node_get(self);
+	node2 = Markly_Node_get(sibling);
 
 	if (!cmark_node_insert_after(node1, node2)) {
 		rb_raise(Markly_Error, "could not insert after");
@@ -675,8 +725,8 @@ static VALUE Markly_Node_insert_after(VALUE self, VALUE sibling) {
  */
 static VALUE Markly_Node_prepend_child(VALUE self, VALUE child) {
 	cmark_node *node1, *node2;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node1);
-	TypedData_Get_Struct(child, cmark_node, &Markly_Node_Type, node2);
+	node1 = Markly_Node_get(self);
+	node2 = Markly_Node_get(child);
 
 	if (!cmark_node_prepend_child(node1, node2)) {
 		rb_raise(Markly_Error, "could not prepend child");
@@ -695,8 +745,8 @@ static VALUE Markly_Node_prepend_child(VALUE self, VALUE child) {
  */
 static VALUE Markly_Node_append_child(VALUE self, VALUE child) {
 	cmark_node *node1, *node2;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node1);
-	TypedData_Get_Struct(child, cmark_node, &Markly_Node_Type, node2);
+	node1 = Markly_Node_get(self);
+	node2 = Markly_Node_get(child);
 
 	if (!cmark_node_append_child(node1, node2)) {
 		rb_raise(Markly_Error, "could not append child");
@@ -711,7 +761,7 @@ static VALUE Markly_Node_append_child(VALUE self, VALUE child) {
  */
 static VALUE Markly_Node_last_child(VALUE self) {
 	cmark_node *node, *child;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	child = cmark_node_last_child(node);
 
@@ -724,7 +774,7 @@ static VALUE Markly_Node_last_child(VALUE self) {
  */
 static VALUE Markly_Node_parent(VALUE self) {
 	cmark_node *node, *parent;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	parent = cmark_node_parent(node);
 
@@ -737,7 +787,7 @@ static VALUE Markly_Node_parent(VALUE self) {
  */
 static VALUE Markly_Node_previous(VALUE self) {
 	cmark_node *node, *previous;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	previous = cmark_node_previous(node);
 
@@ -753,7 +803,7 @@ static VALUE Markly_Node_previous(VALUE self) {
 static VALUE Markly_Node_get_url(VALUE self) {
 	const char *text;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	text = cmark_node_get_url(node);
 	if (text == NULL) {
@@ -775,7 +825,7 @@ static VALUE Markly_Node_set_url(VALUE self, VALUE url) {
 	char *text;
 	Check_Type(url, T_STRING);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	text = StringValueCStr(url);
 
 	if (!cmark_node_set_url(node, text)) {
@@ -794,7 +844,7 @@ static VALUE Markly_Node_set_url(VALUE self, VALUE url) {
 static VALUE Markly_Node_get_title(VALUE self) {
 	const char *text;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	text = cmark_node_get_title(node);
 	if (text == NULL) {
@@ -816,7 +866,7 @@ static VALUE Markly_Node_set_title(VALUE self, VALUE title) {
 	cmark_node *node;
 	Check_Type(title, T_STRING);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	text = StringValueCStr(title);
 
 	if (!cmark_node_set_title(node, text)) {
@@ -835,7 +885,7 @@ static VALUE Markly_Node_set_title(VALUE self, VALUE title) {
 static VALUE Markly_Node_get_header_level(VALUE self) {
 	int header_level;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	header_level = cmark_node_get_header_level(node);
 
@@ -858,7 +908,7 @@ static VALUE Markly_Node_set_header_level(VALUE self, VALUE level) {
 	cmark_node *node;
 	Check_Type(level, T_FIXNUM);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	l = FIX2INT(level);
 
 	if (!cmark_node_set_header_level(node, l)) {
@@ -878,7 +928,7 @@ static VALUE Markly_Node_get_list_type(VALUE self) {
 	int list_type;
 	cmark_node *node;
 	VALUE symbol;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	list_type = cmark_node_get_list_type(node);
 
@@ -905,7 +955,7 @@ static VALUE Markly_Node_set_list_type(VALUE self, VALUE list_type) {
 	cmark_node *node;
 	Check_Type(list_type, T_SYMBOL);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	if (list_type == sym_bullet_list) {
 		type = CMARK_BULLET_LIST;
@@ -931,7 +981,7 @@ static VALUE Markly_Node_set_list_type(VALUE self, VALUE list_type) {
  */
 static VALUE Markly_Node_get_list_start(VALUE self) {
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	if (cmark_node_get_type(node) != CMARK_NODE_LIST ||
 			cmark_node_get_list_type(node) != CMARK_ORDERED_LIST) {
@@ -955,7 +1005,7 @@ static VALUE Markly_Node_set_list_start(VALUE self, VALUE start) {
 	cmark_node *node;
 	Check_Type(start, T_FIXNUM);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	s = FIX2INT(start);
 
 	if (!cmark_node_set_list_start(node, s)) {
@@ -974,7 +1024,7 @@ static VALUE Markly_Node_set_list_start(VALUE self, VALUE start) {
 static VALUE Markly_Node_get_list_tight(VALUE self) {
 	int flag;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	if (cmark_node_get_type(node) != CMARK_NODE_LIST) {
 		rb_raise(Markly_Error, "can't get list_tight for non-list");
@@ -995,7 +1045,7 @@ static VALUE Markly_Node_get_list_tight(VALUE self) {
 static VALUE Markly_Node_set_list_tight(VALUE self, VALUE tight) {
 	int t;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	t = RTEST(tight);
 
 	if (!cmark_node_set_list_tight(node, t)) {
@@ -1014,7 +1064,7 @@ static VALUE Markly_Node_set_list_tight(VALUE self, VALUE tight) {
 static VALUE Markly_Node_get_fence_info(VALUE self) {
 	const char *fence_info;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	fence_info = cmark_node_get_fence_info(node);
 
@@ -1037,7 +1087,7 @@ static VALUE Markly_Node_set_fence_info(VALUE self, VALUE info) {
 	cmark_node *node;
 	Check_Type(info, T_STRING);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	text = StringValueCStr(info);
 
 	if (!cmark_node_set_fence_info(node, text)) {
@@ -1057,7 +1107,7 @@ static VALUE Markly_Node_set_fence_info(VALUE self, VALUE info) {
 static VALUE Markly_Node_get_code_info(VALUE self) {
 	const char *code_info;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	code_info = cmark_node_get_code_info(node);
 
@@ -1085,7 +1135,7 @@ static VALUE Markly_Node_set_code_info(VALUE self, VALUE info) {
 		text = StringValueCStr(info);
 	}
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	if (!cmark_node_set_code_info(node, text)) {
 		rb_raise(Markly_Error, "could not set code_info");
@@ -1104,7 +1154,7 @@ static VALUE Markly_Node_get_fence(VALUE self) {
 	int fence_offset = 0;
 	char fence_character = '\0';
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	
 	if (!cmark_node_get_fenced(node, &fence_length, &fence_offset, &fence_character)) {
 		return Qnil;
@@ -1121,7 +1171,7 @@ static VALUE Markly_Node_get_fence(VALUE self) {
 static VALUE Markly_Node_tasklist_item_checked_p(VALUE self) {
 	int tasklist_state;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	tasklist_state = cmark_gfm_extensions_get_tasklist_item_checked(node);
 
@@ -1143,7 +1193,7 @@ static VALUE Markly_Node_tasklist_item_checked_p(VALUE self) {
 static VALUE Markly_Node_set_tasklist_item_checked(VALUE self, VALUE item_checked) {
 	int tasklist_state;
 	cmark_node *node;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 	tasklist_state = RTEST(item_checked);
 
 	if (!cmark_gfm_extensions_set_tasklist_item_checked(node, tasklist_state)) {
@@ -1160,7 +1210,7 @@ static VALUE Markly_Node_set_tasklist_item_checked(VALUE self, VALUE item_checke
 static VALUE Markly_Node_get_parent_footnote_def(VALUE self) {
 	cmark_node *node;
 	cmark_node *parent;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	parent = cmark_node_parent_footnote_def(node);
 
@@ -1172,7 +1222,7 @@ static VALUE Markly_Node_get_table_alignments(VALUE self) {
 	uint8_t *alignments;
 	cmark_node *node;
 	VALUE ary;
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	column_count = cmark_gfm_extensions_get_table_columns(node);
 	alignments = cmark_gfm_extensions_get_table_alignments(node);
@@ -1201,7 +1251,7 @@ static VALUE Markly_Node_html_escape_href(VALUE self, VALUE rb_text) {
 	cmark_node *node;
 	Check_Type(rb_text, T_STRING);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	cmark_mem *mem = cmark_node_mem(node);
 	cmark_strbuf buf = CMARK_BUF_INIT(mem);
@@ -1221,7 +1271,7 @@ static VALUE Markly_Node_html_escape_html(VALUE self, VALUE rb_text) {
 	cmark_node *node;
 	Check_Type(rb_text, T_STRING);
 
-	TypedData_Get_Struct(self, cmark_node, &Markly_Node_Type, node);
+	node = Markly_Node_get(self);
 
 	cmark_mem *mem = cmark_node_mem(node);
 	cmark_strbuf buf = CMARK_BUF_INIT(mem);
