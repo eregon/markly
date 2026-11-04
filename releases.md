@@ -1,5 +1,9 @@
 # Releases
 
+## Unreleased
+
+  - Connect a node and its Ruby object through a separately allocated link, so freeing a node tree or a `Markly::Node` never accesses other Ruby objects, which is not allowed in a free function and only worked on CRuby by accident (it crashed on TruffleRuby). A node tree is also no longer freed while only a descendant `Markly::Node` is referenced.
+
 ## v0.19.0
 
   - Add `Markly::HTML_BLOCK_BLANK_LINES` for keeping consistently indented HTML content together across blank lines.
